@@ -470,8 +470,8 @@ sealed abstract class Parser[+A] extends Parser0[A] {
     * an epsilon failure, the parsed values (if any) are returned in a
     * list as a successful parse.
     */
-  def rep0: Parser0[List[A]] =
-    Parser.repAs0[A, List[A]](this)
+  def rep0: Repeater0[A, List[A]] =
+    Parser.repAs0[A, List[A]](this)(Accumulator0.listAccumulator0[A])
 
   /** Use this parser to parse at least `min` values (where `min >= 0`).
     *
@@ -485,9 +485,9 @@ sealed abstract class Parser[+A] extends Parser0[A] {
     * also return an arresting failure if it has not parsed at least
     * `min` values (but has consumed input).
     */
-  def rep0(min: Int): Parser0[List[A]] =
+  def rep0(min: Int): Repeating[A, List[A]] =
     if (min == 0) rep0
-    else this.repAs(min)
+    else rep(min).as0[List[A]]
 
   /** Use this parser to parse one-or-more values.
     *
@@ -495,16 +495,16 @@ sealed abstract class Parser[+A] extends Parser0[A] {
     * least one value, and is guaranteed to consume input on successful
     * parses.
     */
-  def rep: Parser[NonEmptyList[A]] =
-    Parser.repAs(this, min = 1)
+  def rep: Repeater[A, NonEmptyList[A]] =
+    Parser.repAs[A, NonEmptyList[A]](this, min = 1)
 
   /** Use this parser to parse at least `min` values (where `min >= 1`).
     *
     * This method behaves likes `rep`, except that if fewer than `min`
     * values are produced an arresting failure will be returned.
     */
-  def rep(min: Int): Parser[NonEmptyList[A]] =
-    Parser.repAs(this, min = min)
+  def rep(min: Int): Repeater[A, NonEmptyList[A]] =
+    Parser.repAs[A, NonEmptyList[A]](this, min = min)
 
   /** This method overrides `Parser0#between` to refine the return type
     */
@@ -763,13 +763,13 @@ object Parser {
   /** Methods with complex variance type signatures due to covariance.
     */
   implicit final class ParserMethods[A](private val self: Parser[A]) extends AnyVal {
-    def repAs0[B](implicit acc: Accumulator0[A, B]): Parser0[B] =
+    def repAs0[B](implicit acc: Accumulator0[A, B]): Repeater0[A, B] =
       Parser.repAs0(self)(acc)
 
-    def repAs[B](implicit acc: Accumulator[A, B]): Parser[B] =
+    def repAs[B](implicit acc: Accumulator[A, B]): Repeater[A, B] =
       Parser.repAs(self, min = 1)(acc)
 
-    def repAs[B](min: Int)(implicit acc: Accumulator[A, B]): Parser[B] =
+    def repAs[B](min: Int)(implicit acc: Accumulator[A, B]): Repeating[A, B] =
       Parser.repAs(self, min = min)(acc)
   }
 
@@ -939,31 +939,24 @@ object Parser {
   /** Repeat this parser 0 or more times
     * note: this can wind up parsing nothing
     */
-  def repAs0[A, B](p1: Parser[A])(implicit acc: Accumulator0[A, B]): Parser0[B] =
-    Impl.Rep0(p1, acc)
+  def repAs0[A, B](p1: Parser[A])(implicit acc: Accumulator0[A, B]): Repeater0[A, B] =
+    Impl.Rep0(p1, Parser.unit, -1, acc)
 
   /** Repeat this parser 1 or more times
     */
-  def repAs[A, B](p1: Parser[A], min: Int)(implicit acc: Accumulator[A, B]): Parser[B] =
-    Impl.Rep(p1, min, acc)
+  def repAs[A, B](p1: Parser[A], min: Int)(implicit acc: Accumulator[A, B]): Repeater[A, B] =
+    Impl.Rep(p1, Parser.unit, min, -1, acc)
 
   /** Repeat 1 or more times with a separator
     */
-  def repSep[A](p1: Parser[A], min: Int, sep: Parser0[Any]): Parser[NonEmptyList[A]] = {
-    if (min <= 0) throw new IllegalArgumentException(s"require min > 0, found: $min")
-
-    val rest = (sep.void.with1.soft *> p1).rep0(min - 1)
-    (p1 ~ rest).map { case (h, t) => NonEmptyList(h, t) }
-  }
+  def repSep[A](p1: Parser[A], min: Int, sep: Parser0[Any]): Repeater[A, NonEmptyList[A]] =
+    Impl.Rep(p1, sep.void, min, -1, Accumulator.nonEmptyListAccumulator0[A])
 
   /** Repeat 0 or more times with a separator
     */
-  def rep0Sep[A](p1: Parser[A], min: Int, sep: Parser0[Any]): Parser0[List[A]] = {
-    if (min <= 0) repSep(p1, 1, sep).?.map {
-      case None => Nil
-      case Some(nel) => nel.toList
-    }
-    else repSep(p1, min, sep).map(_.toList)
+  def rep0Sep[A](p1: Parser[A], min: Int, sep: Parser0[Any]): Repeating[A, List[A]] = {
+    if (min <= 0) Impl.Rep0(p1, sep.void, -1, Accumulator0.listAccumulator0[A])
+    else Impl.Rep(p1, sep.void, min, -1, Accumulator0.listAccumulator0[A])
   }
 
   /** parse first then second
@@ -1611,7 +1604,8 @@ object Parser {
           }
         case Defer0(fn) =>
           Defer0(UnmapDefer0(fn))
-        case Rep0(p, _) => Rep0(unmap(p), Accumulator0.unitAccumulator0)
+        case Rep0(p, p0, max, _) =>
+          Rep0(unmap(p), unmap0(p0).void, max, Accumulator0.unitAccumulator0)
         case StartParser | EndParser | TailRecM0(_, _) | FlatMap0(_, _) =>
           // we can't transform this significantly
           pa
@@ -1693,10 +1687,10 @@ object Parser {
           }
         case Defer(fn) =>
           Defer(UnmapDefer(fn))
-        case Rep(p, m, _) => Rep(unmap(p), m, Accumulator0.unitAccumulator0)
-        case AnyChar | CharIn(_, _, _) | Str(_) | StringIn(_) | IgnoreCase(_) | Fail() | FailWith(
-              _
-            ) | Length(_) | TailRecM(_, _) | FlatMap(_, _) =>
+        case Rep(p, sep, min, max, _) =>
+          Rep(unmap(p), unmap0(sep).void, min, max, Accumulator0.unitAccumulator0)
+        case AnyChar | CharIn(_, _, _) | Str(_) | StringIn(_) | IgnoreCase(_) | Fail() |
+             FailWith(_) | Length(_) | TailRecM(_, _) | FlatMap(_, _) =>
           // we can't transform this significantly
           pa
 
@@ -2138,13 +2132,14 @@ object Parser {
     final def repCapture[A, B](
         p: Parser[A],
         min: Int,
+        max: Int,
         state: State,
         append: Appender[A, B]
     ): Boolean = {
       var offset = state.offset
       var cnt = 0
 
-      while (true) {
+      while (max < 0 || cnt < max) {
         val a = p.parseMut(state)
         if (state.error eq null) {
           cnt += 1
@@ -2154,27 +2149,27 @@ object Parser {
           // there has been an error
           if ((state.offset == offset) && (cnt >= min)) {
             // we correctly read at least min items
-            // reset the error to make the success
+            // and failed with an epsilon for the next item
+            // which means we're done repeating.
+            // reset the error to make the success.
             state.error = null
             return true
           } else {
             // else we did a partial read then failed
-            // but didn't read at least min items
+            // or didn't read at least min items
             return false
           }
         }
       }
-      // $COVERAGE-OFF$
-      // unreachable due to infinite loop
-      return false
-      // $COVERAGE-ON$
+      //max reached, we're done
+      true
     }
 
-    final def repNoCapture[A](p: Parser[A], min: Int, state: State): Unit = {
+    final def repNoCapture[A](p: Parser[A], min: Int, max: Int, state: State): Unit = {
       var offset = state.offset
       var cnt = 0
 
-      while (true) {
+      while (max < 0 || cnt < max) {
         p.parseMut(state)
         if (state.error eq null) {
           cnt += 1
@@ -2193,39 +2188,94 @@ object Parser {
       }
     }
 
-    case class Rep0[A, B](p1: Parser[A], acc: Accumulator0[A, B]) extends Parser0[B] {
+    case class Rep0[A, B](p: Parser[A], sep: Parser0[Unit], max: Int, acc0: Accumulator0[A, B])
+        extends Repeater0[A, B] {
       private[this] val ignore: B = null.asInstanceOf[B]
 
+      override def as0[C](implicit acc: Accumulator0[A, C]): Repeater0[A, C] = Rep0(p, sep, max, acc)
+      override def withMin(min: Int): Repeater[A, B] = {
+        if (min < 0) throw new IllegalArgumentException(s"min was $min, but must be greater than 0")
+        else if (min == 0)
+          throw new IllegalArgumentException("min was 0, use withMin0 instead when min may be 0")
+        else if (max >= 0 && min > max)
+          throw new IllegalArgumentException(
+            s"min was $min, which is larger than $max. This is not allowed."
+          )
+        else Rep(p, sep, min, max, acc0)
+      }
+      def withMin0[BB >: B](min: Int)(implicit acc0: Accumulator0[A,BB]): Repeating[A,BB] =
+        if (min == 0) Rep0(p, sep, max, acc0)
+        else Rep(p, sep, min, max, acc0)
+      override def withMax(max: Int) = Rep0(p, sep, max, acc0)
+      override def withSep[U](sep: Parser0[U]) = Rep0(p, sep.void, max, acc0)
+
       override def parseMut(state: State): B = {
+        //todo: Carefully check what happens on successful and unsuccessful
+        //      parses of first element, incl arresting and epsilon failures
         if (state.capture) {
-          val app = acc.newAppender()
-          if (repCapture(p1, 0, state, app)) app.finish()
-          else ignore
+          val app = acc0.newAppender()
+          p.?.parseMut(state) match {
+            case null => ignore // <-- todo: orly?
+            case Some(a) => {
+              app.append(a)
+              repCapture(sep.with1.soft *> p, 0, max, state, app)
+              app.finish()
+            }
+            case None => app.finish()
+          }
         } else {
-          repNoCapture(p1, 0, state)
+          val preParseOffset = state.offset
+          val initial = p.void
+          initial.parseMut(state)
+          if (state.error eq null) { // <-- todo: unsure
+            //println(s"parsed single $p leading to state $state")
+            repNoCapture(sep.with1.soft *> p, 0, max - 1, state)
+          } else if (preParseOffset == state.offset) {
+            //epsilon error. Recover.
+            state.error = null
+          }
           ignore
         }
       }
     }
 
-    case class Rep[A, B](p1: Parser[A], min: Int, acc1: Accumulator[A, B]) extends Parser[B] {
+    case class Rep[A, B](
+        p: Parser[A],
+        sep: Parser0[Unit],
+        min: Int,
+        max: Int,
+        acc: Accumulator[A, B]
+    ) extends Repeater[A, B] {
       if (min < 1) throw new IllegalArgumentException(s"expected min >= 1, found: $min")
 
       private[this] val ignore: B = null.asInstanceOf[B]
-
       override def parseMut(state: State): B = {
-        val head = p1.parseMut(state)
+        //println(s"in repeater parser $state")
+        val head = p.parseMut(state)
 
         if (state.error ne null) ignore
         else if (state.capture) {
-          val app = acc1.newAppender(head)
-          if (repCapture(p1, min - 1, state, app)) app.finish()
+          //println("onwards capturing")
+          val app = acc.newAppender(head)
+          if (repCapture(sep.with1.soft *> p, min - 1, max - 1, state, app)) app.finish()
           else ignore
         } else {
-          repNoCapture(p1, min - 1, state)
+          repNoCapture(sep.with1.soft *> p, min - 1, max - 1, state)
           ignore
         }
       }
+      
+      override def as0[C](implicit acc0: Accumulator0[A, C]): Repeater[A, C] = Rep(p, sep, min, max, acc0)
+      override def as[C](implicit acc: Accumulator[A, C]): Repeater[A, C] = Rep(p, sep, min, max, acc)
+      override def withMax(max: Int): Repeater[A, B] = Rep(p, sep, min, max, acc)
+      override def withMin(min: Int): Repeater[A, B] =
+        if (min < 0) throw new IllegalArgumentException(s"expected min >= 1, found: $min")
+        else if (min == 0) throw new IllegalArgumentException(s"expected min >= 1, found: 0. use withMin0 instead")
+        else Rep(p, sep, min, max, acc)
+      override def withSep[U](sep: Parser0[U]): Repeater[A, B] = Rep(p, sep.void, min, max, acc)
+      override def withMin0[BB >: B](min: Int)(implicit acc0: Accumulator0[A, BB]): Repeating[A, BB] =
+        if (min == 0) Rep0(p, sep, max, acc0)
+        else withMin(min)
     }
 
     // invariant: input must be sorted
@@ -2366,6 +2416,35 @@ object Parser {
       }
     }
   }
+}
+
+//Parser0 + Accumulator0 = Repeater0
+//Parser + Accumulator = Repeater
+//Parser + Accumulator0 = don't have that (yet?)
+//Parser0 + Accumulator = lub(Repeater0, Repeater) = Repeating
+
+/** Base API for repeating parsers
+ */
+sealed trait Repeating[+A, +B] extends Parser0[B] with Product with Serializable {
+  def max: Int
+  def sep: Parser0[Unit]
+  def withMin0[BB >: B](min: Int)(implicit acc0: Accumulator0[A, BB]): Repeating[A, BB]
+  def withMin(min: Int): Repeater[A, B]
+  def withMax(max: Int): Repeating[A, B]
+  def withSep[U](sep: Parser0[U]): Repeating[A, B]
+  def as0[C](implicit acc0: Accumulator0[A, C]): Repeating[A, C]
+}
+sealed trait Repeater0[+A, +B] extends Repeating[A, B] {
+  override def withMax(max: Int): Repeater0[A, B]
+  override def withSep[U](sep: Parser0[U]): Repeater0[A, B]
+  override def as0[C](implicit acc0: Accumulator0[A, C]): Repeater0[A, C]
+}
+sealed trait Repeater[+A, +B] extends Parser[B] with Repeating[A, B] {
+  def min: Int
+  override def withMax(max: Int): Repeater[A, B]
+  override def withSep[U](sep: Parser0[U]): Repeater[A, B]
+  override def as0[C](implicit acc0: Accumulator0[A, C]): Repeater[A, C]
+  def as[C](implicit acc0: Accumulator[A, C]): Repeater[A, C]
 }
 
 //holds just the typeclass instances, and brings them in implicit scope
